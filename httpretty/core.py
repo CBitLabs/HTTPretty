@@ -495,6 +495,9 @@ class fakesock(object):
 
             if not entries:
                 self._entry = None
+                # We need to make sure that we are not using 'Connection: keep-alive'
+                # as real_sendall hangs in that case.
+                data = re.sub(r"^Connection\s*:.*keep-alive.*$", "", data, count=1, flags=re.I + re.M)
                 self.real_sendall(data)
                 return
 
