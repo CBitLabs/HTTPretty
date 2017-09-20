@@ -361,7 +361,7 @@ class fakesock(object):
                 if self.truesock:
                     self.truesock.connect(self._address)
                 else:
-                    raise UnmockedError()
+                    raise UnmockedError(str(self._address))
 
         def fileno(self):
             if self.truesock:
@@ -409,8 +409,10 @@ class fakesock(object):
             necessary.
             """
 
+            uri = kw.pop('uri', None)
+
             if not self.truesock:
-                raise UnmockedError()
+                raise UnmockedError(uri and uri.full_url() or str(self._address))
 
             if not self.is_http:
                 return self.truesock.sendall(data, *args, **kw)
@@ -502,7 +504,7 @@ class fakesock(object):
                 # We need to make sure that we are not using 'Connection: keep-alive'
                 # as real_sendall hangs in that case.
                 data = re.sub(r"^Connection\s*:.*keep-alive.*$", "Connection: close\r", data, count=1, flags=re.I + re.M)
-                self.real_sendall(data)
+                self.real_sendall(data, uri=info)
                 return
 
             self._entry = matcher.get_next_entry(method, info, request)
