@@ -353,6 +353,10 @@ class fakesock(object):
                     POTENTIAL_HTTP_PORTS.union(POTENTIAL_HTTPS_PORTS))
                 self.is_http = self._port in ports_to_check
 
+            if callable(httpretty.allow_net_connect):
+                if not httpretty.allow_net_connect(address):
+                    self.truesock = None
+
             if not self.is_http:
                 if self.truesock:
                     self.truesock.connect(self._address)
