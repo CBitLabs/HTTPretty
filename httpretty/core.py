@@ -478,6 +478,9 @@ class fakesock(object):
                     return
 
             # path might come with
+            if path.startswith('/'):
+                # Need to make sure that there is a scheme
+                path = 'zz://' + path
             s = urlsplit(path)
             POTENTIAL_HTTP_PORTS.add(int(s.port or 80))
             parts = list(map(utf8, data.split(b'\r\n\r\n', 1)))
