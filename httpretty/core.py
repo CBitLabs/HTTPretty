@@ -737,7 +737,7 @@ class Entry(BaseClass):
 
 
 def url_fix(s, charset='utf-8'):
-    scheme, netloc, path, querystring, fragment = urlsplit(s)
+    scheme, netloc, path, querystring, fragment = urlsplit(s.encode('utf-8'))
     path = quote(path, b'/%')
     querystring = quote_plus(querystring, b':&=')
     return urlunsplit((scheme, netloc, path, querystring, fragment))
