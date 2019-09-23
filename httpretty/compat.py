@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 #
 # <HTTPretty - HTTP client mock for Python>
-# Copyright (C) <2011-2015>  Gabriel Falcão <gabriel@nacaolivre.org>
+# Copyright (C) <2011-2018>  Gabriel Falcao <gabriel@nacaolivre.org>
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation
@@ -26,23 +26,19 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 from __future__ import unicode_literals
 
-import sys
+import io
 import types
 
-PY3 = sys.version_info[0] == 3
+from six import PY3, text_type, string_types, binary_type
+
 if PY3:  # pragma: no cover
-    text_type = str
-    byte_type = bytes
-    import io
     StringIO = io.BytesIO
-    basestring = (str, bytes)
+    basestring = string_types
 
 else:  # pragma: no cover
-    text_type = unicode
-    byte_type = str
     import StringIO
     StringIO = StringIO.StringIO
-    basestring = basestring
+    basestring = string_types
 
 
 class BaseClass(object):
@@ -62,19 +58,48 @@ try:  # pragma: no cover
     from urllib.parse import quote
     from urllib.parse import quote_plus
     from urllib.parse import unquote
+    from urllib.parse import urlencode
     unquote_utf8 = unquote
+
+    def encode_obj(in_obj):
+        return in_obj
 except ImportError:  # pragma: no cover
     from urlparse import urlsplit, urlunsplit, parse_qs, unquote
-    from urllib import quote, quote_plus
+    from urllib import quote, quote_plus, urlencode
 
     def unquote_utf8(qs):
         if isinstance(qs, text_type):
             qs = qs.encode('utf-8')
         s = unquote(qs)
-        if isinstance(s, byte_type):
-            return s.decode("utf-8")
+        if isinstance(s, binary_type):
+            return s.decode('utf-8', errors='ignore')
         else:
             return s
+
+    def encode_obj(in_obj):
+
+        def encode_list(in_list):
+            out_list = []
+            for el in in_list:
+                out_list.append(encode_obj(el))
+            return out_list
+
+        def encode_dict(in_dict):
+            out_dict = {}
+            for k, v in in_dict.iteritems():
+                out_dict[k] = encode_obj(v)
+            return out_dict
+
+        if isinstance(in_obj, unicode):
+            return in_obj.encode('utf-8')
+        elif isinstance(in_obj, list):
+            return encode_list(in_obj)
+        elif isinstance(in_obj, tuple):
+            return tuple(encode_list(in_obj))
+        elif isinstance(in_obj, dict):
+            return encode_dict(in_obj)
+
+        return in_obj
 
 
 try:  # pragma: no cover
@@ -92,11 +117,12 @@ __all__ = [
     'PY3',
     'StringIO',
     'text_type',
-    'byte_type',
+    'binary_type',
     'BaseClass',
     'BaseHTTPRequestHandler',
     'quote',
     'quote_plus',
+    'urlencode',
     'urlunsplit',
     'urlsplit',
     'parse_qs',

@@ -1,7 +1,7 @@
 # #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # <HTTPretty - HTTP client mock for Python>
-# Copyright (C) <2011-2015>  Gabriel Falcão <gabriel@nacaolivre.org>
+# Copyright (C) <2011-2018>  Gabriel Falcao <gabriel@nacaolivre.org>
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation
@@ -25,29 +25,33 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 from __future__ import unicode_literals
 
-import re
 import codecs
-import inspect
-import socket
-import functools
-import itertools
-import warnings
-import traceback
-import json
 import contextlib
-import threading
+import functools
+import hashlib
+import inspect
+import itertools
+import json
+import re
+import socket
 import tempfile
+import threading
+import traceback
+import warnings
 
+from functools import partial
 
 from .compat import (
     PY3,
     StringIO,
     text_type,
-    byte_type,
+    binary_type,
     BaseClass,
     BaseHTTPRequestHandler,
     quote,
     quote_plus,
+    urlencode,
+    encode_obj,
     urlunsplit,
     urlsplit,
     parse_qs,
@@ -83,8 +87,10 @@ old_socksocket = None
 old_ssl_wrap_socket = None
 old_sslwrap_simple = None
 old_sslsocket = None
+old_sslcontext_wrap_socket = None
 
 MULTILINE_ANY_REGEX = re.compile(r'.*', re.M)
+hostname_re = re.compile(r'\^?(?:https?://)?[^:/]*[:/]?')
 
 
 try:  # pragma: no cover
@@ -96,6 +102,10 @@ except ImportError:
 try:  # pragma: no cover
     import ssl
     old_ssl_wrap_socket = ssl.wrap_socket
+    try:
+        old_sslcontext_wrap_socket = ssl.SSLContext.wrap_socket
+    except AttributeError:
+        pass
     if not PY3:
         old_sslwrap_simple = ssl.sslwrap_simple
     old_sslsocket = ssl.SSLSocket
@@ -103,13 +113,11 @@ except ImportError:  # pragma: no cover
     ssl = None
 
 
-# used to handle error caused by ndg-httpsclient
-try:  # pragma: no cover
-    from requests.packages.urllib3.contrib.pyopenssl import inject_into_urllib3, extract_from_urllib3
-    pyopenssl_override = True
-except ImportError:  # pragma: no cover
-    pyopenssl_override = False
-
+try:
+    import requests.packages.urllib3.connection as requests_urllib3_connection
+    old_requests_ssl_wrap_socket = requests_urllib3_connection.ssl_wrap_socket
+except ImportError:
+    requests_urllib3_connection = None
 
 DEFAULT_HTTP_PORTS = frozenset([80])
 POTENTIAL_HTTP_PORTS = set(DEFAULT_HTTP_PORTS)
@@ -117,13 +125,18 @@ DEFAULT_HTTPS_PORTS = frozenset([443])
 POTENTIAL_HTTPS_PORTS = set(DEFAULT_HTTPS_PORTS)
 
 
+def FALLBACK_FUNCTION(x):
+    return x
+
+
 class HTTPrettyRequest(BaseHTTPRequestHandler, BaseClass):
-    """Represents a HTTP request. It takes a valid multi-line, ``\r\n``
-    separated string with HTTP headers and parse them out using the
-    internal `parse_request` method.
+    r"""
+    Represents a HTTP request. It takes a valid multi-line,
+    ``\r\n`` separated string with HTTP headers and parse them out using
+    the internal `parse_request` method.
 
     It also replaces the `rfile` and `wfile` attributes with StringIO
-    instances so that we garantee that it won't make any I/O, neighter
+    instances so that we guarantee that it won't make any I/O, neighter
     for writing nor reading.
 
     It has some convenience attributes:
@@ -137,17 +150,18 @@ class HTTPrettyRequest(BaseHTTPRequestHandler, BaseClass):
     attributes. Please notice that if you need a single value from a
     query string you will need to get it manually like:
 
-    ::
+    ``body`` -> the request body as a string
+
+    ``parsed_body`` -> the request body parsed by ``parse_request_body``
+
+    .. testcode::
 
       >>> request.querystring
       {'name': ['Gabriel Falcao']}
       >>> print request.querystring['name'][0]
 
-    ``parsed_body`` -> a dictionary containing parsed request body or
-    None if HTTPrettyRequest doesn't know how to parse it.  It
-    currently supports parsing body data that was sent under the
-    ``content`-type` headers values: ``application/json`` or
-    ``application/x-www-form-urlencoded``
+
+
     """
     def __init__(self, headers, body=''):
         # first of all, lets make sure that if headers or body are
@@ -193,6 +207,12 @@ class HTTPrettyRequest(BaseHTTPRequestHandler, BaseClass):
 
         # And the body will be attempted to be parsed as
         # `application/json` or `application/x-www-form-urlencoded`
+        """a dictionary containing parsed request body or None if
+        HTTPrettyRequest doesn't know how to parse it.  It currently
+        supports parsing body data that was sent under the
+        ``content`-type` headers values: ``application/json`` or
+        ``application/x-www-form-urlencoded``
+        """
         self.parsed_body = self.parse_request_body(self._body)
 
     @property
@@ -211,7 +231,7 @@ class HTTPrettyRequest(BaseHTTPRequestHandler, BaseClass):
         return bool(self.body) or bool(self.raw_headers)
 
     def __str__(self):
-        tmpl = '<HTTPrettyRequest("{0}", total_headers={1}, body_length={2})>'
+        tmpl = '<HTTPrettyRequest("{}", total_headers={}, body_length={})>'
         return tmpl.format(
             self.headers.get('content-type', ''),
             len(self.headers),
@@ -219,6 +239,12 @@ class HTTPrettyRequest(BaseHTTPRequestHandler, BaseClass):
         )
 
     def parse_querystring(self, qs):
+        """parses an UTF-8 encoded query string into a dict of string lists
+
+        :param qs: a querystring
+        :returns: a dict of lists
+
+        """
         expanded = unquote_utf8(qs)
         parsed = parse_qs(expanded)
         result = {}
@@ -229,14 +255,17 @@ class HTTPrettyRequest(BaseHTTPRequestHandler, BaseClass):
 
     def parse_request_body(self, body):
         """Attempt to parse the post based on the content-type passed.
-        Return the regular body if not"""
+        Return the regular body if not
+
+        :param body: string
+        :returns: a python object such as dict or list in case the deserialization suceeded. Else returns the given param ``body``
+        """
 
         PARSING_FUNCTIONS = {
             'application/json': json.loads,
             'text/json': json.loads,
             'application/x-www-form-urlencoded': self.parse_querystring,
         }
-        FALLBACK_FUNCTION = lambda x: x
 
         content_type = self.headers.get('content-type', '')
 
@@ -244,20 +273,32 @@ class HTTPrettyRequest(BaseHTTPRequestHandler, BaseClass):
         try:
             body = decode_utf8(body)
             return do_parse(body)
-        except:
+        except (Exception, BaseException):
             return body
 
 
 class EmptyRequestHeaders(dict):
-    pass
+    """A dict subclass used as internal representation of empty request
+    headers
+    """
 
 
 class HTTPrettyRequestEmpty(object):
+    """Represents an empty :py:class:`~httpretty.core.HTTPrettyRequest`
+    where all its properties are somehow empty or ``None``
+    """
+
+    method = None
+    url = None
     body = ''
     headers = EmptyRequestHeaders()
 
 
 class FakeSockFile(object):
+    """Fake socket file descriptor. Under the hood all data is written in
+    a temporary file, giving it a real file descriptor number.
+
+    """
     def __init__(self):
         self.file = tempfile.TemporaryFile()
         self._fileno = self.file.fileno()
@@ -280,6 +321,8 @@ class FakeSockFile(object):
 
 
 class FakeSSLSocket(object):
+    """Shorthand for :py:class:`~httpretty.core.fakesock`
+    """
     def __init__(self, sock, *args, **kw):
         self._httpretty_sock = sock
 
@@ -288,7 +331,12 @@ class FakeSSLSocket(object):
 
 
 class fakesock(object):
+    """
+    fake :py:mod:`socket`
+    """
     class socket(object):
+        """drop-in replacement for :py:class:`socket.socket`
+        """
         _entry = None
         debuglevel = 0
         _sent_data = []
@@ -298,6 +346,7 @@ class fakesock(object):
             self.truesock = (old_socket(family, type, protocol)
                              if httpretty.allow_net_connect
                              else None)
+            self._connected_truesock = False
             self._closed = True
             self.fd = FakeSockFile()
             self.fd.socket = _sock or self
@@ -312,7 +361,7 @@ class fakesock(object):
             return {
                 'notAfter': shift.strftime('%b %d %H:%M:%S GMT'),
                 'subjectAltName': (
-                    ('DNS', '*%s' % self._host),
+                    ('DNS', '*.%s' % self._host),
                     ('DNS', self._host),
                     ('DNS', '*'),
                 ),
@@ -358,10 +407,16 @@ class fakesock(object):
                     self.truesock = None
 
             if not self.is_http:
-                if self.truesock:
+                if self.truesock and not self._connected_truesock:
                     self.truesock.connect(self._address)
+                    self._connected_truesock = True
                 else:
                     raise UnmockedError(str(self._address))
+            elif self.truesock and not self._connected_truesock:
+                matcher = httpretty.match_http_address(self._host, self._port)
+                if matcher is None:
+                    self.truesock.connect(self._address)
+                    self._connected_truesock = True
 
         def fileno(self):
             if self.truesock:
@@ -369,9 +424,9 @@ class fakesock(object):
             return self.fd.fileno()
 
         def close(self):
-            if not (self.is_http and self._closed):
-                if self.truesock:
-                    self.truesock.close()
+            if self._connected_truesock:
+                self.truesock.close()
+                self._connected_truesock = False
             self._closed = True
 
         def makefile(self, mode='r', bufsize=-1):
@@ -417,15 +472,21 @@ class fakesock(object):
             if not self.is_http:
                 return self.truesock.sendall(data, *args, **kw)
 
-            self.truesock.connect(self._address)
+            if self._address[1] == 443 and old_sslsocket:
+                sock = old_sslsocket(self.truesock)
+            else:
+                sock = self.truesock
 
-            self.truesock.setblocking(1)
-            self.truesock.sendall(data, *args, **kw)
+            if not self._connected_truesock:
+                sock.connect(self._address)
+
+            sock.setblocking(1)
+            sock.sendall(data, *args, **kw)
 
             should_continue = True
             while should_continue:
                 try:
-                    received = self.truesock.recv(self._bufsize)
+                    received = sock.recv(self._bufsize)
                     self.fd.write(received)
                     should_continue = bool(received.strip())
 
@@ -465,11 +526,7 @@ class fakesock(object):
                     meta = self._entry.request.headers
                     body = utf8(self._sent_data[-1])
                     if meta.get('transfer-encoding', '') == 'chunked':
-                        if (
-                                not body.isdigit()
-                                and (body != b'\r\n')
-                                and (body != b'0\r\n\r\n')
-                        ):
+                        if not body.isdigit() and (body != b'\r\n') and (body != b'0\r\n\r\n'):
                             self._entry.request.body += body
                     else:
                         self._entry.request.body += body
@@ -556,14 +613,25 @@ class fakesock(object):
             return getattr(self.truesock, name)
 
 
-def fake_wrap_socket(s, *args, **kw):
-    return s
+def fake_wrap_socket(orig_wrap_socket_fn, *args, **kw):
+    """drop-in replacement for py:func:`ssl.wrap_socket`
+    """
+    server_hostname = kw.get('server_hostname')
+    if server_hostname is not None:
+        matcher = httpretty.match_https_hostname(server_hostname)
+        if matcher is None:
+                return orig_wrap_socket_fn(*args, **kw)
+    if 'sock' in kw:
+        return kw['sock']
+    else:
+        return args[0]
 
 
 def create_fake_connection(
         address,
         timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
         source_address=None):
+    """drop-in replacement for :py:func:`socket.create_connection`"""
     s = fakesock.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
     if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
         s.settimeout(timeout)
@@ -574,19 +642,38 @@ def create_fake_connection(
 
 
 def fake_gethostbyname(host):
+    """drop-in replacement for :py:func:`socket.gethostbyname`"""
     return '127.0.0.1'
 
 
 def fake_gethostname():
+    """drop-in replacement for :py:func:`socket.gethostname`"""
     return 'localhost'
 
 
 def fake_getaddrinfo(
         host, port, family=None, socktype=None, proto=None, flags=None):
-    return [(2, 1, 6, '', (host, port))]
+    """drop-in replacement for :py:func:`socket.getaddrinfo`"""
+    return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+             '', (host, port))]
 
 
 class Entry(BaseClass):
+    """Created by :py:meth:`~httpretty.core.httpretty.register_uri` and
+    stored in memory as internal representation of a HTTP
+    request/response definition.
+
+    :param method: string
+    :param uri: string
+    :param body: string
+    :param adding_headers: dict - headers to be added to the response
+    :param forcing_headers: dict - headers to be forcefully set in the response
+    :param status: an integer (e.g.: ``status=200``)
+    :param streaming: bool - whether to stream the response
+    :param headers: keyword-args with headers to be added to the response
+
+    .. warning:: When using the ``forcing_headers`` option make sure to add the header ``Content-Length`` otherwise calls using :py:mod:`requests` will try to load the response endlessly.
+    """
     def __init__(self, method, uri, body,
                  adding_headers=None,
                  forcing_headers=None,
@@ -626,6 +713,9 @@ class Entry(BaseClass):
         self.validate()
 
     def validate(self):
+        """validates the body size with the value of the ``Content-Length``
+        header
+        """
         content_length_keys = 'Content-Length', 'content-length'
         for key in content_length_keys:
             got = self.adding_headers.get(
@@ -654,10 +744,19 @@ class Entry(BaseClass):
                 )
 
     def __str__(self):
-        return r'<Entry %s %s getting %d>' % (
-            self.method, self.uri, self.status)
+        return r'<Entry {} {} getting {}>'.format(
+            self.method,
+            self.uri,
+            self.status
+        )
 
     def normalize_headers(self, headers):
+        """Normalize keys in header names so that ``COntent-tyPe`` becomes ``content-type``
+
+        :param headers: dict
+
+        :returns: dict
+        """
         new = {}
         for k in headers:
             new_k = '-'.join([s.lower() for s in k.split('-')])
@@ -666,6 +765,12 @@ class Entry(BaseClass):
         return new
 
     def fill_filekind(self, fk):
+        """writes HTTP Response data to a file descriptor
+
+        :parm fk: a file-like object
+
+        .. warning:: **side-effect:** this method moves the cursor of the given file object to zero
+        """
         now = datetime.utcnow()
 
         headers = {
@@ -718,7 +823,7 @@ class Entry(BaseClass):
 
         for k, v in headers.items():
             string_list.append(
-                '{0}: {1}'.format(k, v),
+                '{}: {}'.format(k, v),
             )
 
         for item in string_list:
@@ -736,7 +841,12 @@ class Entry(BaseClass):
         fk.seek(0)
 
 
-def url_fix(s, charset='utf-8'):
+def url_fix(s, charset=None):
+    """escapes special characters
+    """
+    if charset:
+        warnings.warn("{}.url_fix() charset argument is deprecated".format(__name__), DeprecationWarning)
+
     scheme, netloc, path, querystring, fragment = urlsplit(s)
     path = quote(path, b'/%')
     querystring = quote_plus(querystring, b':&=')
@@ -744,6 +854,28 @@ def url_fix(s, charset='utf-8'):
 
 
 class URIInfo(BaseClass):
+    """Internal representation of `URIs <https://en.wikipedia.org/wiki/Uniform_Resource_Identifier>`_
+
+    .. tip:: all arguments are optional
+
+    :param username:
+    :param password:
+    :param hostname:
+    :param port:
+    :param path:
+    :param query:
+    :param fragment:
+    :param scheme:
+    :param last_request:
+    """
+    default_str_attrs = (
+        'username',
+        'password',
+        'hostname',
+        'port',
+        'path',
+    )
+
     def __init__(self,
                  username='',
                  password='',
@@ -767,7 +899,14 @@ class URIInfo(BaseClass):
 
         self.port = port or 80
         self.path = path or ''
-        self.query = query or ''
+        if query:
+            query_items = sorted(parse_qs(query).items())
+            self.query = urlencode(
+                encode_obj(query_items),
+                doseq=True,
+            )
+        else:
+            self.query = ''
         if scheme:
             self.scheme = scheme
         elif self.port in POTENTIAL_HTTPS_PORTS:
@@ -777,19 +916,19 @@ class URIInfo(BaseClass):
         self.fragment = fragment or ''
         self.last_request = last_request
 
-    def __str__(self):
-        attrs = (
-            'username',
-            'password',
-            'hostname',
-            'port',
-            'path',
-        )
+    def to_str(self, attrs):
         fmt = ", ".join(['%s="%s"' % (k, getattr(self, k, '')) for k in attrs])
         return r'<httpretty.URIInfo(%s)>' % fmt
 
+    def __str__(self):
+        return self.to_str(self.default_str_attrs)
+
+    def str_with_query(self):
+        attrs = self.default_str_attrs + ('query',)
+        return self.to_str(attrs)
+
     def __hash__(self):
-        return hash(text_type(self))
+        return int(hashlib.sha1(binary_type(self, 'ascii')).hexdigest(), 16)
 
     def __eq__(self, other):
         self_tuple = (
@@ -805,14 +944,18 @@ class URIInfo(BaseClass):
         return self_tuple == other_tuple
 
     def full_url(self, use_querystring=True):
+        """
+        :param use_querystring: bool
+        :returns: a string with the full url with the format ``{scheme}://{credentials}{domain}{path}{query}``
+        """
         credentials = ""
         if self.password:
-            credentials = "{0}:{1}@".format(
+            credentials = "{}:{}@".format(
                 self.username, self.password)
 
         query = ""
         if use_querystring and self.query:
-            query = "?{0}".format(decode_utf8(self.query))
+            query = "?{}".format(decode_utf8(self.query))
 
         result = "{scheme}://{credentials}{domain}{path}{query}".format(
             scheme=self.scheme,
@@ -824,6 +967,9 @@ class URIInfo(BaseClass):
         return result
 
     def get_full_domain(self):
+        """
+        :returns: a string in the form ``{domain}:{port}`` or just the domain if the port is 80 or 443
+        """
         hostname = decode_utf8(self.hostname)
         # Port 80/443 should not be appended to the url
         if self.port not in DEFAULT_HTTP_PORTS | DEFAULT_HTTPS_PORTS:
@@ -833,6 +979,10 @@ class URIInfo(BaseClass):
 
     @classmethod
     def from_uri(cls, uri, entry):
+        """
+        :param uri: string
+        :param entry: an instance of :py:class:`~httpretty.core.Entry`
+        """
         result = urlsplit(uri)
         if result.scheme == 'https':
             POTENTIAL_HTTPS_PORTS.add(int(result.port or 443))
@@ -856,7 +1006,8 @@ class URIMatcher(object):
     def __init__(self, uri, entries, match_querystring=False, priority=0):
         self._match_querystring = match_querystring
         # CPython, Jython
-        regex_types = ('SRE_Pattern', 'org.python.modules.sre.PatternObject')
+        regex_types = ('SRE_Pattern', 'org.python.modules.sre.PatternObject',
+                       'Pattern')
         is_regex = type(uri).__name__ in regex_types
         if is_regex:
             self.regex = uri
@@ -876,15 +1027,19 @@ class URIMatcher(object):
 
     def matches(self, info):
         if self.info:
-            return self.info == info
+            # Query string is not considered when comparing info objects, compare separately
+            return self.info == info and (not self._match_querystring or self.info.query == info.query)
         else:
             return self.regex.search(info.full_url(
                 use_querystring=self._match_querystring))
 
     def __str__(self):
-        wrap = 'URLMatcher({0})'
+        wrap = 'URLMatcher({})'
         if self.info:
-            return wrap.format(text_type(self.info))
+            if self._match_querystring:
+                return wrap.format(text_type(self.info.str_with_query()))
+            else:
+                return wrap.format(text_type(self.info))
         else:
             return wrap.format(self.regex.pattern)
 
@@ -927,7 +1082,8 @@ class URIMatcher(object):
 
 
 class httpretty(HttpBaseClass):
-    """The URI registration class"""
+    """manages HTTPretty's internal request/response registry and request matching.
+    """
     _entries = {}
     latest_requests = []
 
@@ -937,6 +1093,10 @@ class httpretty(HttpBaseClass):
 
     @classmethod
     def match_uriinfo(cls, info):
+        """
+        :param info: an :py:class:`~httpretty.core.URIInfo`
+        :returns: a 2-item tuple: (:py:class:`~httpretty.core.URLMatcher`, :py:class:`~httpretty.core.URIInfo`) or ``(None, [])``
+        """
         items = sorted(
             cls._entries.items(),
             key=lambda matcher_entries: matcher_entries[0].priority,
@@ -949,8 +1109,92 @@ class httpretty(HttpBaseClass):
         return (None, [])
 
     @classmethod
+    def match_https_hostname(cls, hostname):
+        """
+        :param hostname: a string
+        :returns: an :py:class:`~httpretty.core.URLMatcher` or ``None``
+        """
+        items = sorted(
+            cls._entries.items(),
+            key=lambda matcher_entries: matcher_entries[0].priority,
+            reverse=True,
+        )
+        for matcher, value in items:
+            if matcher.info is None:
+                pattern_with_port = "https://{0}:".format(hostname)
+                pattern_without_port = "https://{0}/".format(hostname)
+                hostname_pattern = (
+                    hostname_re
+                    .match(matcher.regex.pattern)
+                    .group(0)
+                )
+                for pattern in [pattern_with_port, pattern_without_port]:
+                    if re.match(hostname_pattern, pattern):
+                        return matcher
+
+            elif matcher.info.hostname == hostname:
+                return matcher
+        return None
+
+    @classmethod
+    def match_http_address(cls, hostname, port):
+        """
+        :param hostname: a string
+        :param port: an integer
+        :returns: an :py:class:`~httpretty.core.URLMatcher` or ``None``
+        """
+        items = sorted(
+            cls._entries.items(),
+            key=lambda matcher_entries: matcher_entries[0].priority,
+            reverse=True,
+        )
+        for matcher, value in items:
+            if matcher.info is None:
+                if port in POTENTIAL_HTTPS_PORTS:
+                    scheme = 'https://'
+                else:
+                    scheme = 'http://'
+
+                pattern_without_port = "{0}{1}/".format(scheme, hostname)
+                pattern_with_port = "{0}{1}:{2}/".format(scheme, hostname, port)
+                hostname_pattern = (
+                    hostname_re
+                    .match(matcher.regex.pattern)
+                    .group(0)
+                )
+                for pattern in [pattern_with_port, pattern_without_port]:
+                    if re.match(hostname_pattern, pattern):
+                        return matcher
+
+            elif matcher.info.hostname == hostname \
+                    and matcher.info.port == port:
+                return matcher
+
+        return None
+
+    @classmethod
     @contextlib.contextmanager
     def record(cls, filename, indentation=4, encoding='utf-8'):
+        """
+        .. testcode::
+
+           import io
+           import json
+           import requests
+           import httpretty
+
+           with httpretty.record('/tmp/ip.json'):
+               data = requests.get('https://httpbin.org/ip').json()
+
+           with io.open('/tmp/ip.json') as fd:
+               assert data == json.load(fd)
+
+        :param filename: a string
+        :param indentation: an integer, defaults to **4**
+        :param encoding: a string, defaults to **"utf-8"**
+
+        :returns: a `context-manager <https://docs.python.org/3/reference/datamodel.html#context-managers>`_
+        """
         try:
             import urllib3
         except ImportError:
@@ -983,7 +1227,12 @@ class httpretty(HttpBaseClass):
                 'response': {
                     'status': response.status,
                     'body': decode_utf8(response.data),
-                    'headers': dict(response.headers)
+                    # urllib3 1.10 had a bug if you just did:
+                    # dict(response.headers)
+                    # which would cause all the values to become lists
+                    # with the header name as the first item and the
+                    # true value as the second item. Workaround that
+                    'headers': dict(response.headers.items())
                 }
             })
             cls.enable()
@@ -999,10 +1248,27 @@ class httpretty(HttpBaseClass):
 
     @classmethod
     @contextlib.contextmanager
-    def playback(cls, origin):
+    def playback(cls, filename):
+        """
+        .. testcode::
+
+           import io
+           import json
+           import requests
+           import httpretty
+
+           with httpretty.record('/tmp/ip.json'):
+               data = requests.get('https://httpbin.org/ip').json()
+
+           with io.open('/tmp/ip.json') as fd:
+               assert data == json.load(fd)
+
+        :param filename: a string
+        :returns: a `context-manager <https://docs.python.org/3/reference/datamodel.html#context-managers>`_
+        """
         cls.enable()
 
-        data = json.loads(open(origin).read())
+        data = json.loads(open(filename).read())
         for item in data:
             uri = item['request']['uri']
             method = item['request']['method']
@@ -1015,6 +1281,8 @@ class httpretty(HttpBaseClass):
 
     @classmethod
     def reset(cls):
+        """resets the internal state of HTTPretty, unregistering all URLs
+        """
         POTENTIAL_HTTP_PORTS.intersection_update(DEFAULT_HTTP_PORTS)
         POTENTIAL_HTTPS_PORTS.intersection_update(DEFAULT_HTTPS_PORTS)
         cls._entries.clear()
@@ -1023,6 +1291,18 @@ class httpretty(HttpBaseClass):
 
     @classmethod
     def historify_request(cls, headers, body='', append=True):
+        """appends request to a list for later retrieval
+
+        .. testcode::
+
+           import httpretty
+
+           httpretty.register_uri(httpretty.GET, 'https://httpbin.org/ip', body='')
+           with httpretty.enabled():
+               requests.get('https://httpbin.org/ip')
+
+           assert httpretty.latest_requests[-1].url == 'https://httpbin.org/ip'
+        """
         request = HTTPrettyRequest(headers, body)
         cls.last_request = request
         if append or not cls.latest_requests:
@@ -1032,14 +1312,48 @@ class httpretty(HttpBaseClass):
         return request
 
     @classmethod
-    def register_uri(cls, method, uri, body='HTTPretty :)',
+    def register_uri(cls, method, uri, body='{"message": "HTTPretty :)"}',
                      adding_headers=None,
                      forcing_headers=None,
                      status=200,
-                     responses=None, match_querystring=False,
+                     responses=None,
+                     match_querystring=False,
                      priority=0,
                      **headers):
+        """
+        .. testcode::
 
+           import httpretty
+
+
+           def request_callback(request, uri, response_headers):
+               content_type = request.headers.get('Content-Type')
+               assert request.body == '{"nothing": "here"}', 'unexpected body: {}'.format(request.body)
+               assert content_type == 'application/json', 'expected application/json but received Content-Type: {}'.format(content_type)
+               return [200, response_headers, json.dumps({"hello": "world"})]
+
+           httpretty.register_uri(
+               HTTPretty.POST, "https://httpretty.example.com/api",
+               body=request_callback)
+
+
+           with httpretty.enabled():
+               requests.post('https://httpretty.example.com/api', data='{"nothing": "here"}', headers={'Content-Type': 'application/json'})
+
+           assert httpretty.latest_requests[-1].url == 'https://httpbin.org/ip'
+
+
+        :param method: one of ``httpretty.GET``, ``httpretty.PUT``, ``httpretty.POST``, ``httpretty.DELETE``, ``httpretty.HEAD``, ``httpretty.PATCH``, ``httpretty.OPTIONS``, ``httpretty.CONNECT``
+        :param uri: a string (e.g.: **"https://httpbin.org/ip"**)
+        :param body: a string, defaults to ``{"message": "HTTPretty :)"}``
+        :param adding_headers: dict - headers to be added to the response
+        :param forcing_headers: dict - headers to be forcefully set in the response
+        :param status: an integer, defaults to **200**
+        :param responses: a list of entries, ideally each created with :py:meth:`~httpretty.core.httpretty.Response`
+        :param priority: an integer, useful for setting higher priority over previously registered urls. defaults to zero
+        :param match_querystring: bool - whether to take the querystring into account when matching an URL
+        :param headers: headers to be added to the response
+        """
         uri_is_string = isinstance(uri, basestring)
 
         if uri_is_string and re.search(r'^\w+://[^/]+[.]\w{2,}$', uri):
@@ -1080,17 +1394,49 @@ class httpretty(HttpBaseClass):
             forcing_headers=None,
             status=200,
             streaming=False,
-            **headers):
+            **kw):
+        """
+        shortcut to create an :py:class:`~httpretty.core.Entry` that takes the body as first positional argument
 
-        headers[str('body')] = body
-        headers[str('adding_headers')] = adding_headers
-        headers[str('forcing_headers')] = forcing_headers
-        headers[str('status')] = int(status)
-        headers[str('streaming')] = streaming
-        return Entry(method, uri, **headers)
+        .. seealso:: the parameters of this function match those of the :py:class:`~httpretty.core.Entry` constructor
+        :param body:
+        :param method: one of ``httpretty.GET``, ``httpretty.PUT``, ``httpretty.POST``, ``httpretty.DELETE``, ``httpretty.HEAD``, ``httpretty.PATCH``, ``httpretty.OPTIONS``, ``httpretty.CONNECT``
+        :param uri:
+        :param adding_headers:
+        :param forcing_headers:
+        :param status: defaults to **200**
+        :param streaming: defaults to **False**
+        :param kw: keyword-arguments passed onto the :py:class:`~httpretty.core.Entry`
+        :returns: an :py:class:`~httpretty.core.Entry`
+        """
+        kw['body'] = body
+        kw['adding_headers'] = adding_headers
+        kw['forcing_headers'] = forcing_headers
+        kw['status'] = int(status)
+        kw['streaming'] = streaming
+        return Entry(method, uri, **kw)
 
     @classmethod
     def disable(cls):
+        """Disables HTTPretty entirely, putting the original :py:mod:`socket`
+        module back in its place.
+
+
+        .. code::
+
+           import re, json
+           import httpretty
+
+           httpretty.enable()
+           # request passes through fake socket
+           response = requests.get('https://httpbin.org')
+
+           httpretty.disable()
+           # request uses real python socket module
+           response = requests.get('https://httpbin.org')
+
+        .. note:: This method does not call :py:meth:`httpretty.core.reset` automatically.
+        """
         cls._is_enabled = False
         socket.socket = old_socket
         socket.SocketType = old_SocketType
@@ -1117,6 +1463,10 @@ class httpretty(HttpBaseClass):
         if ssl:
             ssl.wrap_socket = old_ssl_wrap_socket
             ssl.SSLSocket = old_sslsocket
+            try:
+                ssl.SSLContext.wrap_socket = old_sslcontext_wrap_socket
+            except AttributeError:
+                pass
             ssl.__dict__['wrap_socket'] = old_ssl_wrap_socket
             ssl.__dict__['SSLSocket'] = old_sslsocket
 
@@ -1124,16 +1474,58 @@ class httpretty(HttpBaseClass):
                 ssl.sslwrap_simple = old_sslwrap_simple
                 ssl.__dict__['sslwrap_simple'] = old_sslwrap_simple
 
-        if pyopenssl_override:
-            # Replace PyOpenSSL Monkeypatching
-            inject_into_urllib3()
+        if requests_urllib3_connection is not None:
+            requests_urllib3_connection.ssl_wrap_socket = \
+                old_requests_ssl_wrap_socket
+            requests_urllib3_connection.__dict__['ssl_wrap_socket'] = \
+                old_requests_ssl_wrap_socket
 
     @classmethod
     def is_enabled(cls):
+        """Check if HTTPretty is enabled
+
+        :returns: bool
+
+        .. testcode::
+
+           import httpretty
+
+           httpretty.enable()
+           assert httpretty.is_enabled() == True
+
+           httpretty.disable()
+           assert httpretty.is_enabled() == False
+        """
         return cls._is_enabled
 
     @classmethod
-    def enable(cls):
+    def enable(cls, allow_net_connect=True):
+        """Enables HTTPretty.
+        When ``allow_net_connect`` is ``False`` any connection to an unregistered uri will throw :py:class:`httpretty.errors.UnmockedError`.
+
+        .. testcode::
+
+           import re, json
+           import httpretty
+
+           httpretty.enable()
+
+           httpretty.register_uri(
+               httpretty.GET,
+               re.compile(r'http://.*'),
+               body=json.dumps({'man': 'in', 'the': 'middle'})
+           )
+
+           response = requests.get('https://foo.bar/foo/bar')
+
+           response.json().should.equal({
+               "man": "in",
+               "the": "middle",
+           })
+
+        .. warning:: after calling this method the original :py:mod:`socket` is replaced with :py:class:`httpretty.core.fakesock`. Make sure to call :py:meth:`~httpretty.disable` after done with your tests or use the :py:class:`httpretty.enabled` as decorator or `context-manager <https://docs.python.org/3/reference/datamodel.html#context-managers>`_
+        """
+        cls.allow_net_connect = allow_net_connect
         cls._is_enabled = True
         # Some versions of python internally shadowed the
         # SocketType variable incorrectly https://bugs.python.org/issue20386
@@ -1164,33 +1556,100 @@ class httpretty(HttpBaseClass):
             socks.__dict__['socksocket'] = fakesock.socket
 
         if ssl:
-            ssl.wrap_socket = fake_wrap_socket
+            new_wrap = partial(fake_wrap_socket, old_ssl_wrap_socket)
+            ssl.wrap_socket = new_wrap
             ssl.SSLSocket = FakeSSLSocket
+            try:
+                ssl.SSLContext.wrap_socket = partial(fake_wrap_socket, old_sslcontext_wrap_socket)
+            except AttributeError:
+                pass
 
-            ssl.__dict__['wrap_socket'] = fake_wrap_socket
+            ssl.__dict__['wrap_socket'] = new_wrap
             ssl.__dict__['SSLSocket'] = FakeSSLSocket
 
             if not PY3:
-                ssl.sslwrap_simple = fake_wrap_socket
-                ssl.__dict__['sslwrap_simple'] = fake_wrap_socket
+                ssl.sslwrap_simple = new_wrap
+                ssl.__dict__['sslwrap_simple'] = new_wrap
 
-        if pyopenssl_override:
-            # Remove PyOpenSSL monkeypatch - use the default implementation
-            extract_from_urllib3()
+        if requests_urllib3_connection is not None:
+            new_wrap = partial(fake_wrap_socket, old_requests_ssl_wrap_socket)
+            requests_urllib3_connection.ssl_wrap_socket = new_wrap
+            requests_urllib3_connection.__dict__['ssl_wrap_socket'] = new_wrap
+
 
 class httprettized(object):
+    """`context-manager <https://docs.python.org/3/reference/datamodel.html#context-managers>`_ for enabling HTTPretty.
+
+    .. testcode::
+
+       import json
+       import httpretty
+
+       httpretty.register_uri(httpretty.GET, 'https://httpbin.org/ip', body=json.dumps({'origin': '42.42.42.42'}))
+       with httpretty.enabled():
+           response = requests.get('https://httpbin.org/ip')
+
+       assert httpretty.latest_requests[-1].url == 'https://httpbin.org/ip'
+       assert response.json() == {'origin': '42.42.42.42'}
+    """
+    def __init__(self, allow_net_connect=True):
+        self.allow_net_connect = allow_net_connect
 
     def __enter__(self):
         httpretty.reset()
-        httpretty.enable()
+        httpretty.enable(allow_net_connect=self.allow_net_connect)
 
     def __exit__(self, exc_type, exc_value, traceback):
         httpretty.disable()
         httpretty.reset()
 
 
-def httprettified(test):
+def httprettified(test=None, allow_net_connect=True):
+    """decorator for test functions
 
+    .. tip:: Also available under the alias :py:func:`httpretty.activate`
+
+    :param test: a callable
+
+
+    example usage with `nosetests <https://nose.readthedocs.io/en/latest/>`_
+
+    .. testcode::
+
+       import sure
+       from httpretty import httprettified
+
+       @httprettified
+       def test_using_nosetests():
+           httpretty.register_uri(
+               httpretty.GET,
+               'https://httpbin.org/ip'
+           )
+
+           response = requests.get('https://httpbin.org/ip')
+
+           response.json().should.equal({
+               "message": "HTTPretty :)"
+           })
+
+    example usage with `unittest module <https://docs.python.org/3/library/unittest.html>`_
+
+    .. testcode::
+
+       import unittest
+       from sure import expect
+       from httpretty import httprettified
+
+       @httprettified
+       class TestWithPyUnit(unittest.TestCase):
+           def test_httpbin(self):
+               httpretty.register_uri(httpretty.GET, 'https://httpbin.org/ip')
+               response = requests.get('https://httpbin.org/ip')
+               expect(response.json()).to.equal({
+                   "message": "HTTPretty :)"
+               })
+
+    """
     def decorate_unittest_TestCase_setUp(klass):
 
         # Prefer addCleanup (added in python 2.7), but fall back
@@ -1200,8 +1659,10 @@ def httprettified(test):
         original_setUp = (klass.setUp
                           if hasattr(klass, 'setUp')
                           else None)
+
         def new_setUp(self):
-            httpretty.enable()
+            httpretty.reset()
+            httpretty.enable(allow_net_connect)
             if use_addCleanup:
                 self.addCleanup(httpretty.disable)
             if original_setUp:
@@ -1212,8 +1673,10 @@ def httprettified(test):
             original_tearDown = (klass.setUp
                                  if hasattr(klass, 'tearDown')
                                  else None)
+
             def new_tearDown(self):
                 httpretty.disable()
+                httpretty.reset()
                 if original_tearDown:
                     original_tearDown(self)
             klass.tearDown = new_tearDown
@@ -1248,10 +1711,12 @@ def httprettified(test):
     def decorate_callable(test):
         @functools.wraps(test)
         def wrapper(*args, **kw):
-            with httprettized():
+            with httprettized(allow_net_connect):
                 return test(*args, **kw)
         return wrapper
 
     if isinstance(test, ClassTypes):
         return decorate_class(test)
-    return decorate_callable(test)
+    elif callable(test):
+        return decorate_callable(test)
+    return decorate_callable
