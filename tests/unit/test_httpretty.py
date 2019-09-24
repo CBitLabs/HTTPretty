@@ -217,6 +217,32 @@ def test_uri_info_full_url():
     )
 
 
+def test_uri_info_eq_handles_unicode():
+    """Test that URIInfo.__eq__ method handles unicode
+    """
+    uri_info_1 = URIInfo(
+        username='johhny',
+        password='password',
+        hostname=b'GOOGLE.COM',
+        port=80,
+        path=u"\U0001f4a9".encode('utf-8'),
+        query=b'foo=bar&baz=test',
+        fragment='',
+        scheme='',
+    )
+    uri_info_2 = URIInfo(
+        username='johhny',
+        password='password',
+        hostname=b'google.com',
+        port=80,
+        path=u"\U0001f4a9".encode('utf-8'),
+        query=b'foo=bar&baz=test',
+        fragment='',
+        scheme='',
+    )
+    expect(uri_info_1).to.equal(uri_info_2)
+
+
 def test_uri_info_eq_ignores_case():
     """Test that URIInfo.__eq__ method ignores case for
     hostname matching.

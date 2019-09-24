@@ -848,8 +848,8 @@ def url_fix(s, charset=None):
         warnings.warn("{}.url_fix() charset argument is deprecated".format(__name__), DeprecationWarning)
 
     scheme, netloc, path, querystring, fragment = urlsplit(s)
-    path = quote(path, b'/%')
-    querystring = quote_plus(querystring, b':&=')
+    path = quote(path.encode('utf-8'), b'/%')
+    querystring = quote_plus(querystring.encode('utf-8'), b':&=')
     return urlunsplit((scheme, netloc, path, querystring, fragment))
 
 
@@ -916,8 +916,17 @@ class URIInfo(BaseClass):
         self.fragment = fragment or ''
         self.last_request = last_request
 
+    def getattrsafe(self, attr, default):
+        val = getattr(self, attr, default)
+        try:
+            if isinstance(val, str):
+                u"" + val
+            return val
+        except Exception as e:
+            return val.decode('utf-8')
+
     def to_str(self, attrs):
-        fmt = ", ".join(['%s="%s"' % (k, getattr(self, k, '')) for k in attrs])
+        fmt = ", ".join(['%s="%s"' % (k, self.getattrsafe(k, '')) for k in attrs])
         return r'<httpretty.URIInfo(%s)>' % fmt
 
     def __str__(self):
