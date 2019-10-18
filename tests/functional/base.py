@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # <HTTPretty - HTTP client mock for Python>
-# Copyright (C) <2011-2015>  Gabriel Falcão <gabriel@nacaolivre.org>
+# Copyright (C) <2011-2018>  Gabriel Falcão <gabriel@nacaolivre.org>
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation
@@ -63,7 +63,7 @@ class JSONEchoHandler(tornado.web.RequestHandler):
         payload = dict(self.request.arguments)
         self.write(json.dumps({
             matched or 'index': payload,
-            'req_body': self.request.body,
+            'req_body': self.request.body.decode('utf-8'),
             'req_headers': dict(self.request.headers.items()),
         }, indent=4))
 
@@ -88,10 +88,12 @@ class JSONEchoServer(threading.Thread):
         ])
 
     def run(self):
+        loop = tornado.ioloop.IOLoop()
+
         application = self.setup_application()
         application.listen(self.port)
         self.lock.release()
-        tornado.ioloop.IOLoop.instance().start()
+        loop.start()
 
 
 def use_tornado_server(callback):

@@ -10,6 +10,7 @@ from sure import expect
 
 from httpretty.compat import StringIO
 from httpretty.core import HTTPrettyRequest, FakeSSLSocket, fakesock, httpretty
+from httpretty.core import URIMatcher, URIInfo
 
 
 class SocketErrorStub(Exception):
@@ -53,7 +54,6 @@ def test_request_stubs_internals():
 
     # And the `method` should be available
     request.should.have.property('method').being.equal('POST')
-
 
 
 def test_request_parse_querystring():
@@ -198,8 +198,8 @@ def test_fakesock_socket_getpeercert(dt):
     # Given a fake socket instance
     socket = fakesock.socket()
 
-    # And that it's bound to some host and port
-    socket.connect(('somewhere.com', 80))
+    # And that it's bound to some host
+    socket._host = 'somewhere.com'
 
     # When I retrieve the peer certificate
     certificate = socket.getpeercert()
@@ -212,7 +212,7 @@ def test_fakesock_socket_getpeercert(dt):
             ((u'organizationalUnitName', u'Domain Control Validated'),),
             ((u'commonName', u'*.somewhere.com'),)),
         u'subjectAltName': (
-            (u'DNS', u'*somewhere.com'),
+            (u'DNS', u'*.somewhere.com'),
             (u'DNS', u'somewhere.com'),
             (u'DNS', u'*')
         )
@@ -232,7 +232,6 @@ def test_fakesock_socket_ssl():
 
     # Then it should have returned its first argument
     result.should.equal(sentinel)
-
 
 
 @patch('httpretty.core.old_socket')
@@ -263,6 +262,7 @@ def test_fakesock_socket_close(old_socket):
     # Given a fake socket instance that is synthetically open
     socket = fakesock.socket()
     socket._closed = False
+    socket._connected_truesock = True
 
     # When I close it
     socket.close()
@@ -432,7 +432,7 @@ def test_fakesock_socket_real_sendall_socket_error_when_http(socket, old_socket)
 
 @patch('httpretty.core.old_socket')
 @patch('httpretty.core.POTENTIAL_HTTP_PORTS')
-def test_fakesock_socket_real_sendall_when_http(POTENTIAL_HTTP_PORTS, old_socket):
+def test_fakesock_socket_real_sendall_when_sending_data(POTENTIAL_HTTP_PORTS, old_socket):
     ("fakesock.socket#real_sendall should connect before sending data")
     # Background: the real socket will stop returning bytes after the
     # first call
@@ -608,3 +608,49 @@ def test_fakesock_socket_sendall_with_body_data_with_chunked_entry(POTENTIAL_HTT
 
     # Then the entry should have that body
     httpretty.last_request.body.should.equal(b'BLABLABLABLA')
+
+
+def test_URIMatcher_respects_querystring():
+    ("URIMatcher response querystring")
+    matcher = URIMatcher('http://www.foo.com/?query=true', None)
+    info = URIInfo.from_uri('http://www.foo.com/', None)
+    assert matcher.matches(info)
+
+    matcher = URIMatcher('http://www.foo.com/?query=true', None, match_querystring=True)
+    info = URIInfo.from_uri('http://www.foo.com/', None)
+    assert not matcher.matches(info)
+
+    matcher = URIMatcher('http://www.foo.com/?query=true', None, match_querystring=True)
+    info = URIInfo.from_uri('http://www.foo.com/?query=true', None)
+    assert matcher.matches(info)
+
+    matcher = URIMatcher('http://www.foo.com/?query=true&unquery=false', None, match_querystring=True)
+    info = URIInfo.from_uri('http://www.foo.com/?unquery=false&query=true', None)
+    assert matcher.matches(info)
+
+    matcher = URIMatcher('http://www.foo.com/?unquery=false&query=true', None, match_querystring=True)
+    info = URIInfo.from_uri('http://www.foo.com/?query=true&unquery=false', None)
+    assert matcher.matches(info)
+
+
+def test_URIMatcher_equality_respects_querystring():
+    ("URIMatcher equality check should check querystring")
+    matcher_a = URIMatcher('http://www.foo.com/?query=true', None)
+    matcher_b = URIMatcher('http://www.foo.com/?query=false', None)
+    assert matcher_a == matcher_b
+
+    matcher_a = URIMatcher('http://www.foo.com/?query=true', None)
+    matcher_b = URIMatcher('http://www.foo.com/', None)
+    assert matcher_a == matcher_b
+
+    matcher_a = URIMatcher('http://www.foo.com/?query=true', None, match_querystring=True)
+    matcher_b = URIMatcher('http://www.foo.com/?query=false', None, match_querystring=True)
+    assert not matcher_a == matcher_b
+
+    matcher_a = URIMatcher('http://www.foo.com/?query=true', None, match_querystring=True)
+    matcher_b = URIMatcher('http://www.foo.com/', None, match_querystring=True)
+    assert not matcher_a == matcher_b
+
+    matcher_a = URIMatcher('http://www.foo.com/?query=true&unquery=false', None, match_querystring=True)
+    matcher_b = URIMatcher('http://www.foo.com/?unquery=false&query=true', None, match_querystring=True)
+    assert matcher_a == matcher_b
