@@ -502,6 +502,8 @@ class fakesock(object):
             self.fd = FakeSockFile()
             self.fd.socket = self
             try:
+                if isinstance(data, memoryview):
+                    data = data.tobytes()
                 requestline, _ = data.split(b'\r\n', 1)
                 method, path, version = parse_requestline(
                     decode_utf8(requestline))
