@@ -502,6 +502,8 @@ class fakesock(object):
             self.fd = FakeSockFile()
             self.fd.socket = self
             try:
+                if isinstance(data, memoryview):
+                    data = data.tobytes()
                 requestline, _ = data.split(b'\r\n', 1)
                 method, path, version = parse_requestline(
                     decode_utf8(requestline))
@@ -1074,14 +1076,22 @@ class URIMatcher(object):
         if self.current_entries[method] != -1:
             self.current_entries[method] += 1
 
+        # Create a copy of the original entry to make it thread-safe
+        body = entry.callable_body if entry.body_is_callable else entry.body
+        new_entry = Entry(entry.method, entry.uri, body,
+                          status=entry.status,
+                          streaming=entry.streaming,
+                          adding_headers=entry.adding_headers,
+                          forcing_headers=entry.forcing_headers)
+
         # Attach more info to the entry
         # So the callback can be more clever about what to do
         # This does also fix the case where the callback
         # would be handed a compiled regex as uri instead of the
         # real uri
-        entry.info = info
-        entry.request = request
-        return entry
+        new_entry.info = info
+        new_entry.request = request
+        return new_entry
 
     def __hash__(self):
         return hash(text_type(self))
